@@ -5,7 +5,7 @@ from sbi.utils import RestrictedPrior
 from tabpfn import TabPFNClassifier
 
 
-class NPE_PF_RestrictedPrior(RestrictedPrior):
+class NPE_PFN_RestrictedPrior(RestrictedPrior):
     def __init__(self, prior, acceptance_threshold=0.3, tabpfn_classifier_kwargs=None):
         self.classifier = TabPFNClassifier(
             **tabpfn_classifier_kwargs if tabpfn_classifier_kwargs else {}

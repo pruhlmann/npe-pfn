@@ -5,13 +5,13 @@ import torch
 from sbi import inference as inference
 from torch.distributions import Distribution
 
-from npe_pf.npe_pf import TabPFN_Based_NPE_PF
-from npe_pf.support_posterior import PosteriorSupport
+from npe_pfn.npe_pfn import TabPFN_Based_NPE_PFN
+from npe_pfn.support_posterior import PosteriorSupport
 
 log = logging.getLogger(__name__)
 
 
-def run_tsnpe_pf(
+def run_tsnpe_pfn(
     simulator: Callable,
     prior: Distribution,
     observation: torch.Tensor,
@@ -30,7 +30,7 @@ def run_tsnpe_pf(
     regressor_init_kwargs: Mapping = {},
     classifier_init_kwargs: Mapping = {},
 ):
-    """Runs TSNPE-PF with the given parameters.
+    """Runs TSNPE-PFN with the given parameters.
     Args:
         simulator: Simulator function, which takes theta and returns x
         prior: Prior distribution
@@ -50,14 +50,14 @@ def run_tsnpe_pf(
         regressor_init_kwargs: Keyword arguments for regressor initialization
         classifier_init_kwargs: Keyword arguments for classifier initialization
     Returns:
-        posterior: `TabPFN_Based_NPE_PF` object
+        posterior: `TabPFN_Based_NPE_PFN` object
     """
 
     if num_rounds == 1:
-        log.info(f"Running NPE_PF")
+        log.info(f"Running NPE_PFN")
         num_simulations_per_round = num_simulations
     else:
-        log.info(f"Running TSNPE_PF")
+        log.info(f"Running TSNPE_PFN")
         num_simulations_per_round = num_simulations // num_rounds
 
     log.info(f"Number of simulations per round: {num_simulations_per_round}")
@@ -66,7 +66,7 @@ def run_tsnpe_pf(
         simulation_batch_size = num_simulations_per_round
         log.warning("Reduced simulation_batch_size to num_simulation_per_round")
 
-    tabpfn_posterior = TabPFN_Based_NPE_PF(
+    tabpfn_posterior = TabPFN_Based_NPE_PFN(
         prior=prior,
         regressor_init_kwargs=regressor_init_kwargs,
         classifier_init_kwargs=classifier_init_kwargs,

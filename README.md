@@ -1,18 +1,18 @@
-# NPE-PF: Effortless, Simulation-Efficient Bayesian Inference using Tabular Foundation Models
+# NPE-PFN: Effortless, Simulation-Efficient Bayesian Inference using Tabular Foundation Models
 
-This is a minimal repository implementing NPE-PF, a method for simulation-based inference using tabular foundation models, together with its sequential variant TSNPE-PF. See the associated [preprint](https://arxiv.org/abs/2504.17660).
+This is a minimal repository implementing NPE-PFN, a method for simulation-based inference using tabular foundation models, together with its sequential variant TSNPE-PFN. See the associated [preprint](https://arxiv.org/abs/2504.17660).
 
 In this implementation, [TabPFNv2](https://github.com/PriorLabs/TabPFN) is used as the tabular foundation model.
 
-**NOTE:** This repository is under active development. In the future, the NPE-PF interface will be aligned with the one used in the [`sbi`](https://github.com/sbi-dev/sbi) package. Expect rough edges and breaking changes.
+**NOTE:** This repository is under active development. In the future, the NPE-PFN interface will be aligned with the one used in the [`sbi`](https://github.com/sbi-dev/sbi) package. Expect rough edges and breaking changes.
 
 ## Installation
 
 Clone the repository and install with pip:
 
 ```bash
-git clone https://github.com/mackelab/npe-pf
-cd npe-pf
+git clone https://github.com/mackelab/npe-pfn
+cd npe-pfn
 pip install -e .
 ```
 
@@ -20,7 +20,7 @@ pip install -e .
 
 ```python
 import torch
-from npe_pf import TabPFN_Based_NPE_PF
+from npe_pfn import TabPFN_Based_NPE_PFN
 
 prior = ... # torch distribution
 simulator = ... # callable
@@ -30,7 +30,7 @@ num_simulations = 1000
 thetas = prior.sample((num_simulations,))
 xs = simulator(thetas)
 
-posterior_estimator = TabPFN_Based_NPE_PF(prior=prior)
+posterior_estimator = TabPFN_Based_NPE_PFN(prior=prior)
 posterior_estimator.append_simulations(thetas, xs)
 
 # NO TRAINING!
@@ -39,7 +39,7 @@ num_posterior_samples = 10_000
 posterior_samples = posterior_estimator.sample((num_posterior_samples,), x=x_o)
 ```
 
-See `demo.ipynb` for detailed usage examples of both NPE-PF and TSNPE-PF.
+See `demo.ipynb` for detailed usage examples of both NPE-PFN and TSNPE-PFN.
 
 ## Testing
 

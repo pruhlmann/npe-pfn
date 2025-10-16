@@ -9,8 +9,8 @@ from tabpfn import TabPFNClassifier, TabPFNRegressor
 from torch import Tensor
 from torch.distributions import Distribution
 
-from npe_pf.accept_reject_sampler import accept_reject_sample
-from npe_pf.support_posterior import get_filtering_method
+from npe_pfn.accept_reject_sampler import accept_reject_sample
+from npe_pfn.support_posterior import get_filtering_method
 
 # Suppress specific sklearn warnings
 warnings.filterwarnings(
@@ -23,7 +23,7 @@ warnings.filterwarnings(
 )
 
 
-class NPE_PF_Core:
+class NPE_PFN_Core:
     """TabPFN-based simulation-based inference that follows SBI-like interface.
 
     This class provides similar functionality to SBI's NPE (Neural Posterior Estimation)
@@ -536,7 +536,7 @@ class DensityRatioWrapper:
 
 
 # NOTE: Can never support batched sampling, as context depends on x
-class TabPFN_Based_NPE_PF(NPE_PF_Core):
+class TabPFN_Based_NPE_PFN(NPE_PFN_Core):
     def __init__(
         self,
         show_progress_bars: bool = False,
@@ -575,7 +575,7 @@ class TabPFN_Based_NPE_PF(NPE_PF_Core):
         return theta_context, x_context
 
 
-class TabPFN_Based_Uncond_Estimator(NPE_PF_Core):
+class TabPFN_Based_Uncond_Estimator(NPE_PFN_Core):
     # NOTE: experimental, beware of rough edges
 
     def __init__(
