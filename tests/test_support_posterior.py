@@ -4,8 +4,8 @@ import time
 import pytest
 import torch
 
-from npe_pf.npe_pf import TabPFN_Based_NPE_PF
-from npe_pf.support_posterior import PosteriorSupport
+from npe_pfn.npe_pfn import TabPFN_Based_NPE_PFN
+from npe_pfn.support_posterior import PosteriorSupport
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ def test_posterior_support(
     x_train = simulator(theta_train)
 
     # Initialize and train model
-    posterior = TabPFN_Based_NPE_PF(
+    posterior = TabPFN_Based_NPE_PFN(
         prior=prior,
         filter_type="standardized_euclidean_filtering",
     )

@@ -4,9 +4,9 @@ import time
 import pytest
 import torch
 
-from npe_pf.npe_pf import (
-    TabPFN_Based_NPE_PF,
-    NPE_PF_Core,
+from npe_pfn.npe_pfn import (
+    TabPFN_Based_NPE_PFN,
+    NPE_PFN_Core,
     TabPFN_Based_Uncond_Estimator,
 )
 
@@ -54,7 +54,7 @@ def test_sampling_and_log_prob_base(
     theta_test = torch.randn(n_test, feature_dim)
     x_test = theta_test @ w.T + torch.randn(n_test, obs_dim) * 0.1 + 1.0
 
-    inference_model = NPE_PF_Core(prior=prior)
+    inference_model = NPE_PFN_Core(prior=prior)
     inference_model.append_simulations(theta, x)
     # sample
     theta_posterior = inference_model.sample(
@@ -106,7 +106,7 @@ def test_sampling_and_log_prob_base(
         ),
     ],
 )
-def test_sampling_and_log_prob_NPE_PF(
+def test_sampling_and_log_prob_NPE_PFN(
     n_samples,
     n_context,
     n_test,
@@ -126,7 +126,7 @@ def test_sampling_and_log_prob_NPE_PF(
     theta_test = torch.randn(n_test, feature_dim)
     x_test = theta_test @ w.T + torch.randn(n_test, obs_dim) * 0.1 + 1.0
 
-    inference_model = TabPFN_Based_NPE_PF(
+    inference_model = TabPFN_Based_NPE_PFN(
         prior=prior,
         filter_type=filter,
         filter_context_size=n_context,
@@ -173,7 +173,7 @@ def test_ratio_based_log_prob(n_train, n_context, grid_size, num_posterior_sampl
     x_train = simulator(theta_train)
 
     # Initialize and train model
-    inference_model = TabPFN_Based_NPE_PF(
+    inference_model = TabPFN_Based_NPE_PFN(
         prior=prior,
         filter_type="standardized_euclidean_filtering",
         filter_context_size=n_context,
