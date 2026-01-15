@@ -180,3 +180,7 @@ cython_debug/
 
 # logs
 sbi-logs
+
+# Evaluation data and results
+data/
+results/
