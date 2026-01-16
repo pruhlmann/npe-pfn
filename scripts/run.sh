@@ -43,6 +43,8 @@ python scripts/evaluate_ropefm.py \
     --num_cal 10 50 200 1000 \
     --seeds 0 \
     --max_test_samples 2000 \
+    --batch_size 10 \
+    --gpu_num 0 \
     --output_dir $OUTPUT_DIR
 
 echo "=============================================="

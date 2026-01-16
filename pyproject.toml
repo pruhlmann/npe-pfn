@@ -40,7 +40,7 @@ classifiers = [
 
 [tool.basedpyright]
 venvPath = "/home/pruhlman/miniconda3/envs/"
-venv = "npe_pfn"
+venv = "npe-fn"
 typeCheckingMode = "basic"
 reportAssignmentType = "none"
 # ignore=['*']

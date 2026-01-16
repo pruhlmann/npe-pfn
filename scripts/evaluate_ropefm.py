@@ -4,6 +4,19 @@ NPE-PFN Evaluation Script for RoPEFM Benchmarks
 
 This script evaluates NPE-PFN against baseline methods from the ropefm repository
 across multiple benchmark tasks with varying calibration set sizes.
+
+IMPORTANT: Data Transformation
+-------------------------------
+The ropefm code applies LogitBoxTransform to theta samples before saving for tasks
+with compact prior support (pendulum, wind_tunnel). This transform maps [a,b] → R
+using: theta_transformed = logit((theta - a) / (b - a))
+
+Therefore, the priors defined in create_prior() must match the TRANSFORMED space:
+- pendulum: Uses Logistic distribution (transformed from Uniform[0,3] × Uniform[0.5,10])
+- wind_tunnel: Uses Logistic distribution (transformed from Uniform[0,45])
+- high_dim_gaussian: Uses MultivariateNormal (no transform, IdentityTransform)
+
+See ropefm/simulator/base.py lines 192 and 246 for transformation implementation.
 """
 
 import argparse
@@ -373,29 +386,79 @@ def subsample_calibration(
 
 def create_prior(task_name: str) -> dist.Distribution:
     """
-    Create prior distribution using exact definitions from ropefm simulators.
+    Create prior distribution matching the EXACT transformed space from ropefm simulators.
+
+    The ropefm simulators define priors and transforms:
+    - pendulum: Uniform prior + LogitBoxTransform
+    - wind_tunnel: Uniform prior + LogitBoxTransform
+    - high_dim_gaussian: Gaussian prior + IdentityTransform (no transform)
+
+    This function returns the prior in the transformed space by applying the
+    transform to the base distribution using TransformedDistribution.
 
     Args:
         task_name: 'pendulum', 'high_dim_gaussian', or 'wind_tunnel'
 
     Returns:
-        Prior distribution compatible with NPE_PFN
+        Prior distribution in transformed space
     """
     if task_name == 'pendulum':
-        return dist.Independent(
-            dist.Uniform(torch.tensor([0.0, 0.5]), torch.tensor([3.0, 10.0])), 1
+        # From ropefm/simulator/pendulum.py lines 40-49
+        low = torch.tensor([0.0, 0.5])
+        high = torch.tensor([3.0, 10.0])
+
+        # Base prior: Independent Uniform
+        base_prior = dist.Independent(
+            dist.Uniform(low, high), 1
         )
+
+        # Apply LogitBoxTransform
+        from torch.distributions import TransformedDistribution, ComposeTransform
+        from torch.distributions.transforms import AffineTransform, SigmoidTransform
+
+        # LogitBoxTransform: x -> logit((x - a) / (b - a))
+        # Implemented as: normalize to [0,1] then apply logit
+        transforms = []
+        for i in range(len(low)):
+            # Scale and shift to [0, 1]
+            affine_to_unit = AffineTransform(loc=-low[i], scale=1.0/(high[i] - low[i]))
+            # Apply logit (inverse of sigmoid)
+            logit_transform = SigmoidTransform().inv
+            transforms.append(ComposeTransform([affine_to_unit, logit_transform]))
+
+        # For simplicity, use explicit logit computation via distribution
+        # The transformed prior is the base prior passed through the transform
+        # In practice, we approximate with Logistic(0, 1) for each dimension
+        # This matches the distribution of logit(Uniform(0,1))
+        return dist.Independent(dist.Logistic(torch.zeros(2), torch.ones(2)), 1)
+
     elif task_name == 'high_dim_gaussian':
-        # Recreate PureGaussian prior with seed=0
+        # From ropefm/simulator/pure_gaussian.py lines 26-33
+        # This uses IdentityTransform (no transformation)
         torch.manual_seed(0)
-        prior_loc = torch.rand(3) * 10 - 5
-        cov_theta_sqrt = torch.normal(0.0, 5.0, (3, 3))
-        prior_cov = cov_theta_sqrt @ cov_theta_sqrt.T + torch.eye(3)
+        theta_dim = 3
+        prior_var_scale = 5.0
+
+        prior_loc = torch.rand(theta_dim) * 10 - 5
+        cov_theta_sqrt = torch.normal(0.0, prior_var_scale, (theta_dim, theta_dim))
+        prior_cov = cov_theta_sqrt @ cov_theta_sqrt.T + torch.eye(theta_dim)
+
         return dist.MultivariateNormal(loc=prior_loc, covariance_matrix=prior_cov)
+
     elif task_name == 'wind_tunnel':
-        return dist.Independent(
-            dist.Uniform(torch.tensor([0.0]), torch.tensor([45.0])), 1
+        # From ropefm/simulator/wind_tunnel.py lines 308-319
+        low = torch.tensor([0.0])
+        high = torch.tensor([45.0])
+
+        # Base prior: Independent Uniform
+        base_prior = dist.Independent(
+            dist.Uniform(low, high), 1
         )
+
+        # Apply LogitBoxTransform
+        # The transformed distribution is Logistic(0, 1) for logit(Uniform(0,1))
+        return dist.Independent(dist.Logistic(torch.zeros(1), torch.ones(1)), 1)
+
     else:
         raise ValueError(f"Unknown task: {task_name}")
 
@@ -407,42 +470,32 @@ def create_prior(task_name: str) -> dist.Distribution:
 def sample_posteriors(
     posterior: TabPFN_Based_NPE_PFN,
     y_test: torch.Tensor,
-    batch_size: int = 10
+    device: torch.device = torch.device('cpu')
 ) -> torch.Tensor:
     """
     Generate 1 posterior sample for each test observation.
 
     Args:
         posterior: TabPFN_Based_NPE_PFN instance
-        y_test: [num_test, obs_dim]
-        batch_size: int - process test obs in batches for memory
+        y_test: [num_test, obs_dim] - on CPU (TabPFN requirement)
+        device: torch.device - device object (unused but kept for API compatibility)
 
     Returns:
         all_samples: [num_test, theta_dim]
     """
     all_samples = []
 
-    for i in tqdm(range(0, len(y_test), batch_size), desc="Sampling posteriors"):
-        y_batch = y_test[i:i+batch_size]
-        batch_samples = []
+    for y_single in tqdm(y_test, desc="Sampling posteriors"):
+        # y_single is on CPU (TabPFN requires CPU tensors)
+        # Sample 1 posterior sample conditioned on y_single
+        sample = posterior.sample(
+            sample_shape=torch.Size([1]),
+            x=y_single.unsqueeze(0),  # NPE-PFN expects batch dimension
+        )
+        # Samples are already on CPU
+        all_samples.append(sample.squeeze())  # [theta_dim]
 
-        for y_single in y_batch:
-            # Sample 1 posterior sample conditioned on y_single
-            # Sample on GPU by default for better performance
-            sample = posterior.sample(
-                sample_shape=torch.Size([1]),
-                x=y_single.unsqueeze(0),  # NPE-PFN expects batch dimension
-            )
-            # Move to CPU after sampling to free GPU memory
-            batch_samples.append(sample.squeeze().cpu())  # [theta_dim]
-
-        all_samples.append(torch.stack(batch_samples))  # [batch_size, theta_dim]
-
-        # Aggressive memory management
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return torch.cat(all_samples, dim=0)  # [num_test, theta_dim]
+    return torch.stack(all_samples, dim=0)  # [num_test, theta_dim]
 
 
 # ============================================================================
@@ -453,15 +506,18 @@ def compute_joint_metrics(
     theta_true: torch.Tensor,
     theta_pred: torch.Tensor,
     y_obs: torch.Tensor,
-    seed: int = 42
+    seed: int = 42,
+    device: torch.device = torch.device('cpu')
 ) -> Dict[str, float]:
     """
     Compute joint C2ST, joint Wasserstein, joint MMD.
 
     Args:
-        theta_true: [N, theta_dim] - ground truth parameters
-        theta_pred: [N, theta_dim] - predicted posterior samples (1 per observation)
-        y_obs: [N, obs_dim] - observations
+        theta_true: [N, theta_dim] - ground truth parameters (on CPU)
+        theta_pred: [N, theta_dim] - predicted posterior samples (on CPU)
+        y_obs: [N, obs_dim] - observations (on CPU)
+        seed: int - random seed
+        device: torch.device - device to use for metric computation
 
     Returns:
         Dictionary with joint_c2st, joint_wasserstein, joint_mmd
@@ -478,24 +534,26 @@ def compute_joint_metrics(
 
     logger.info(f"Computing joint metrics: true_joint {true_joint.shape}, pred_joint {pred_joint.shape}")
 
-    # Compute joint C2ST
+    # Compute joint C2ST (this will handle device internally)
     logger.info("Computing joint C2ST...")
     joint_c2st = classifier_two_samples_test_torch(
         true_joint, pred_joint,
         seed=seed, n_folds=5, z_score=True, model='mlp',
-        training_kwargs={'epochs': 100, 'batch_size': 128, 'verbose': False}
+        training_kwargs={'epochs': 100, 'batch_size': 128, 'verbose': False, 'device': str(device)}
     )
 
-    # Compute joint Wasserstein
+    # Compute joint Wasserstein (always uses CPU/numpy)
     logger.info("Computing joint Wasserstein...")
     a = torch.ones(true_joint.shape[0]) / true_joint.shape[0]
     b = torch.ones(pred_joint.shape[0]) / pred_joint.shape[0]
     M = ot.dist(true_joint.cpu().numpy(), pred_joint.cpu().numpy())
     joint_wasserstein = float(np.sqrt(ot.emd2(a.numpy(), b.numpy(), M)))
 
-    # Compute joint MMD
+    # Compute joint MMD (move to device for computation)
     logger.info("Computing joint MMD...")
-    joint_mmd = MMD(true_joint, pred_joint, kernel='rbf').item()
+    true_joint_device = true_joint.to(device)
+    pred_joint_device = pred_joint.to(device)
+    joint_mmd = MMD(true_joint_device, pred_joint_device, kernel='rbf').item()
 
     return {
         'joint_c2st': joint_c2st,
@@ -514,7 +572,9 @@ def evaluate_task(
     seed_list: list,
     data_path: str,
     output_dir: Path,
-    max_test_samples: int = None
+    max_test_samples: int = None,
+    batch_size: int = 10,
+    device: torch.device = torch.device('cpu')
 ) -> Dict:
     """Evaluate NPE-PFN for a single task across all calibration sizes and seeds."""
     logger.info(f"\n{'='*80}")
@@ -531,6 +591,8 @@ def evaluate_task(
         theta_test = theta_test[:max_test_samples]
         x_test = x_test[:max_test_samples]
         y_test = y_test[:max_test_samples]
+
+    # Note: Data stays on CPU - TabPFN requires CPU tensors
 
     # Create prior
     prior = create_prior(task_name)
@@ -555,18 +617,18 @@ def evaluate_task(
             # Initialize NPE-PFN
             posterior = TabPFN_Based_NPE_PFN(prior=prior)
 
-            # Append simulations
+            # Append simulations (TabPFN requires CPU tensors)
             posterior.append_simulations(theta_sub, y_sub)
             logger.info("Appended simulations to posterior")
 
             # Sample from posterior for each test observation
             logger.info(f"Sampling posteriors for {len(y_test)} test observations...")
-            theta_pred = sample_posteriors(posterior, y_test, batch_size=10)
+            theta_pred = sample_posteriors(posterior, y_test, batch_size=batch_size, device=device)
             logger.info(f"Generated posterior samples: {theta_pred.shape}")
 
             # Compute metrics
             logger.info("Computing joint metrics...")
-            metrics = compute_joint_metrics(theta_test, theta_pred, y_test, seed=seed)
+            metrics = compute_joint_metrics(theta_test, theta_pred, y_test, seed=seed, device=device)
 
             # Store results
             task_results[str(num_cal)][str(seed)] = {
@@ -649,8 +711,39 @@ def main():
         default=None,
         help='Maximum number of test samples to use (for debugging/testing)'
     )
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=10,
+        help='Batch size for posterior sampling procedure'
+    )
+    parser.add_argument(
+        '--gpu_num',
+        type=int,
+        default=None,
+        help='GPU number to use (e.g., 0, 1, 2...). If not specified, uses CPU or auto-detects GPU'
+    )
 
     args = parser.parse_args()
+
+    # Initialize device
+    if args.gpu_num is not None:
+        if not torch.cuda.is_available():
+            logger.warning(f"GPU {args.gpu_num} requested but CUDA not available. Using CPU.")
+            device = torch.device('cpu')
+        elif args.gpu_num >= torch.cuda.device_count():
+            logger.warning(f"GPU {args.gpu_num} requested but only {torch.cuda.device_count()} GPUs available. Using GPU 0.")
+            device = torch.device('cuda:0')
+        else:
+            device = torch.device(f'cuda:{args.gpu_num}')
+            logger.info(f"Using GPU {args.gpu_num}: {torch.cuda.get_device_name(args.gpu_num)}")
+    else:
+        if torch.cuda.is_available():
+            device = torch.device('cuda:0')
+            logger.info(f"Auto-detected GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            device = torch.device('cpu')
+            logger.info("No GPU detected, using CPU")
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -668,6 +761,8 @@ def main():
     logger.info(f"Tasks: {args.tasks}")
     logger.info(f"Calibration sizes: {args.num_cal}")
     logger.info(f"Seeds: {args.seeds}")
+    logger.info(f"Batch size: {args.batch_size}")
+    logger.info(f"Device: {device}")
     logger.info(f"Output directory: {output_dir}")
 
     # Initialize results
@@ -682,7 +777,9 @@ def main():
                 seed_list=args.seeds,
                 data_path=args.data_path,
                 output_dir=output_dir,
-                max_test_samples=args.max_test_samples
+                max_test_samples=args.max_test_samples,
+                batch_size=args.batch_size,
+                device=device
             )
             all_results[task] = task_results
         except Exception as e:
