@@ -607,27 +607,31 @@ def compute_conditional_metrics(
     Returns:
         Dictionary with conditional_c2st, conditional_wasserstein, conditional_mmd
     """
-    logger.info(f"Computing conditional metrics: theta_pred {theta_pred.shape}, theta_true {theta_true_samples.shape}")
+    # Ensure all data is on CPU before computing metrics
+    theta_pred_cpu = theta_pred.detach().cpu()
+    theta_true_cpu = theta_true_samples.detach().cpu()
+
+    logger.info(f"Computing conditional metrics: theta_pred {theta_pred_cpu.shape}, theta_true {theta_true_cpu.shape}")
 
     # Compute conditional C2ST
     logger.info("Computing conditional C2ST...")
     conditional_c2st = classifier_two_samples_test_torch(
-        theta_true_samples, theta_pred,
+        theta_true_cpu, theta_pred_cpu,
         seed=seed, n_folds=5, z_score=True, model='mlp',
         training_kwargs={'epochs': 100, 'batch_size': 128, 'verbose': False, 'device': str(device)}
     )
 
     # Compute conditional Wasserstein
     logger.info("Computing conditional Wasserstein...")
-    a = torch.ones(theta_true_samples.shape[0]) / theta_true_samples.shape[0]
-    b = torch.ones(theta_pred.shape[0]) / theta_pred.shape[0]
-    M = ot.dist(theta_true_samples.cpu().numpy(), theta_pred.cpu().numpy())
+    a = torch.ones(theta_true_cpu.shape[0]) / theta_true_cpu.shape[0]
+    b = torch.ones(theta_pred_cpu.shape[0]) / theta_pred_cpu.shape[0]
+    M = ot.dist(theta_true_cpu.numpy(), theta_pred_cpu.numpy())
     conditional_wasserstein = float(np.sqrt(ot.emd2(a.numpy(), b.numpy(), M)))
 
-    # Compute conditional MMD
+    # Compute conditional MMD (move to device for computation)
     logger.info("Computing conditional MMD...")
-    theta_true_device = theta_true_samples.to(device)
-    theta_pred_device = theta_pred.to(device)
+    theta_true_device = theta_true_cpu.to(device)
+    theta_pred_device = theta_pred_cpu.to(device)
     conditional_mmd = MMD(theta_true_device, theta_pred_device, kernel='rbf').item()
 
     return {
@@ -652,24 +656,29 @@ def compute_joint_metrics(
     Compute joint C2ST, joint Wasserstein, joint MMD.
 
     Args:
-        theta_true: [N, theta_dim] - ground truth parameters (on CPU)
-        theta_pred: [N, theta_dim] - predicted posterior samples (on CPU)
-        y_obs: [N, obs_dim] - observations (on CPU)
+        theta_true: [N, theta_dim] - ground truth parameters
+        theta_pred: [N, theta_dim] - predicted posterior samples
+        y_obs: [N, obs_dim] - observations
         seed: int - random seed
         device: torch.device - device to use for metric computation
 
     Returns:
         Dictionary with joint_c2st, joint_wasserstein, joint_mmd
     """
+    # Ensure all data is on CPU before computing metrics
+    theta_true_cpu = theta_true.detach().cpu()
+    theta_pred_cpu = theta_pred.detach().cpu()
+    y_obs_cpu = y_obs.detach().cpu()
+
     # Flatten y_obs if it's multi-dimensional
-    if y_obs.ndim > 2:
-        y_obs = y_obs.reshape(y_obs.shape[0], -1)
+    if y_obs_cpu.ndim > 2:
+        y_obs_cpu = y_obs_cpu.reshape(y_obs_cpu.shape[0], -1)
 
     # Create true joint: [theta_true, y_obs]
-    true_joint = torch.cat([theta_true, y_obs], dim=1)  # [N, d_theta+d_obs]
+    true_joint = torch.cat([theta_true_cpu, y_obs_cpu], dim=1)  # [N, d_theta+d_obs]
 
     # Create predicted joint: [theta_pred, y_obs]
-    pred_joint = torch.cat([theta_pred, y_obs], dim=1)  # [N, d_theta+d_obs]
+    pred_joint = torch.cat([theta_pred_cpu, y_obs_cpu], dim=1)  # [N, d_theta+d_obs]
 
     logger.info(f"Computing joint metrics: true_joint {true_joint.shape}, pred_joint {pred_joint.shape}")
 
@@ -681,11 +690,11 @@ def compute_joint_metrics(
         training_kwargs={'epochs': 100, 'batch_size': 128, 'verbose': False, 'device': str(device)}
     )
 
-    # Compute joint Wasserstein (always uses CPU/numpy)
+    # Compute joint Wasserstein
     logger.info("Computing joint Wasserstein...")
     a = torch.ones(true_joint.shape[0]) / true_joint.shape[0]
     b = torch.ones(pred_joint.shape[0]) / pred_joint.shape[0]
-    M = ot.dist(true_joint.cpu().numpy(), pred_joint.cpu().numpy())
+    M = ot.dist(true_joint.numpy(), pred_joint.numpy())
     joint_wasserstein = float(np.sqrt(ot.emd2(a.numpy(), b.numpy(), M)))
 
     # Compute joint MMD (move to device for computation)
