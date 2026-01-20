@@ -499,6 +499,149 @@ def sample_posteriors(
 
 
 # ============================================================================
+# GAUSSIAN POSTERIOR COMPUTATION
+# ============================================================================
+
+def create_gaussian_posterior_params(seed: int = 0, theta_dim: int = 3, obs_dim: int = 3,
+                                      prior_var_scale: float = 5.0,
+                                      likelihood_var_scale: float = 2.0,
+                                      noisy_var_scale: float = 5.0):
+    """
+    Create parameters for the Gaussian task matching ropefm/simulator/pure_gaussian.py.
+    Returns all necessary parameters to compute ground truth posterior.
+    """
+    torch.manual_seed(seed)
+
+    # Prior parameters
+    prior_loc = torch.rand((theta_dim,)) * 10 - 5
+    cov_theta_sqrt = torch.normal(0.0, prior_var_scale, (theta_dim, theta_dim))
+    prior_cov = cov_theta_sqrt @ cov_theta_sqrt.T + torch.eye(theta_dim)
+
+    # Likelihood parameters
+    cov_likelihood_sqrt = torch.normal(0.0, likelihood_var_scale, (obs_dim, obs_dim))
+    A = torch.normal(0.0, 1.0, (obs_dim, theta_dim))
+    b = torch.normal(0.0, 1.0, (obs_dim,))
+    likelihood_cov = cov_likelihood_sqrt @ cov_likelihood_sqrt.T
+
+    # Noisy process parameters
+    cov_noisy_sqrt = torch.normal(0.0, noisy_var_scale, (obs_dim, obs_dim))
+    C = torch.normal(1.0, 1.0, (obs_dim, obs_dim))
+    d = torch.rand((obs_dim,)) * 5 + 5
+    noise_cov = cov_noisy_sqrt @ cov_noisy_sqrt.T
+
+    return {
+        'prior_loc': prior_loc,
+        'prior_cov': prior_cov,
+        'A': A,
+        'b': b,
+        'likelihood_cov': likelihood_cov,
+        'C': C,
+        'd': d,
+        'noise_cov': noise_cov
+    }
+
+
+def compute_gaussian_posterior_distribution(y: torch.Tensor, params: Dict) -> dist.MultivariateNormal:
+    """
+    Compute the ground truth posterior p(theta | y) for the Gaussian task.
+
+    Args:
+        y: Noisy observations of shape (batch_size, obs_dim)
+        params: Dictionary with prior, likelihood, and noise parameters
+
+    Returns:
+        MultivariateNormal distribution representing p(theta | y)
+    """
+    # Extract parameters
+    mu_theta = params['prior_loc']
+    Sigma_theta = params['prior_cov']
+    A = params['A']
+    b = params['b']
+    Sigma_lik = params['likelihood_cov']
+    C = params['C']
+    d = params['d']
+    Sigma_noise = params['noise_cov']
+
+    # Linear mapping from theta to y
+    F = C @ A
+    c = C @ b + d
+    Sigma_y = C @ Sigma_lik @ C.T + Sigma_noise
+
+    # Inverses
+    Sigma_y_inv = torch.linalg.inv(Sigma_y)
+    Sigma_theta_inv = torch.linalg.inv(Sigma_theta)
+
+    # Posterior covariance
+    Sigma_post = torch.linalg.inv(Sigma_theta_inv + F.T @ Sigma_y_inv @ F)
+
+    # Center y
+    y_centered = y - c
+    mean_post = (
+        Sigma_post @ (Sigma_theta_inv @ mu_theta + y_centered @ (Sigma_y_inv @ F)).T
+    ).T  # shape (batch_size, theta_dim)
+
+    return dist.MultivariateNormal(
+        loc=mean_post, covariance_matrix=Sigma_post.expand(y.shape[0], -1, -1)
+    )
+
+
+# ============================================================================
+# CONDITIONAL METRIC COMPUTATION
+# ============================================================================
+
+def compute_conditional_metrics(
+    theta_pred: torch.Tensor,
+    theta_true_samples: torch.Tensor,
+    seed: int = 42,
+    device: torch.device = torch.device('cpu')
+) -> Dict[str, float]:
+    """
+    Compute conditional metrics comparing NPE-PFN samples vs ground truth posterior samples.
+
+    Args:
+        theta_pred: [N, theta_dim] - NPE-PFN posterior samples, one per observation
+        theta_true_samples: [N, theta_dim] - Ground truth posterior samples, one per observation
+        seed: int - random seed
+        device: torch.device - device to use for metric computation
+
+    Returns:
+        Dictionary with conditional_c2st, conditional_wasserstein, conditional_mmd
+    """
+    # Ensure all data is on CPU before computing metrics
+    theta_pred_cpu = theta_pred.detach().cpu()
+    theta_true_cpu = theta_true_samples.detach().cpu()
+
+    logger.info(f"Computing conditional metrics: theta_pred {theta_pred_cpu.shape}, theta_true {theta_true_cpu.shape}")
+
+    # Compute conditional C2ST
+    logger.info("Computing conditional C2ST...")
+    conditional_c2st = classifier_two_samples_test_torch(
+        theta_true_cpu, theta_pred_cpu,
+        seed=seed, n_folds=5, z_score=True, model='mlp',
+        training_kwargs={'epochs': 100, 'batch_size': 128, 'verbose': False, 'device': str(device)}
+    )
+
+    # Compute conditional Wasserstein
+    logger.info("Computing conditional Wasserstein...")
+    a = torch.ones(theta_true_cpu.shape[0]) / theta_true_cpu.shape[0]
+    b = torch.ones(theta_pred_cpu.shape[0]) / theta_pred_cpu.shape[0]
+    M = ot.dist(theta_true_cpu.numpy(), theta_pred_cpu.numpy())
+    conditional_wasserstein = float(np.sqrt(ot.emd2(a.numpy(), b.numpy(), M)))
+
+    # Compute conditional MMD (move to device for computation)
+    logger.info("Computing conditional MMD...")
+    theta_true_device = theta_true_cpu.to(device)
+    theta_pred_device = theta_pred_cpu.to(device)
+    conditional_mmd = MMD(theta_true_device, theta_pred_device, kernel='rbf').item()
+
+    return {
+        'conditional_c2st': conditional_c2st,
+        'conditional_wasserstein': conditional_wasserstein,
+        'conditional_mmd': conditional_mmd
+    }
+
+
+# ============================================================================
 # JOINT METRIC COMPUTATION
 # ============================================================================
 
@@ -513,24 +656,29 @@ def compute_joint_metrics(
     Compute joint C2ST, joint Wasserstein, joint MMD.
 
     Args:
-        theta_true: [N, theta_dim] - ground truth parameters (on CPU)
-        theta_pred: [N, theta_dim] - predicted posterior samples (on CPU)
-        y_obs: [N, obs_dim] - observations (on CPU)
+        theta_true: [N, theta_dim] - ground truth parameters
+        theta_pred: [N, theta_dim] - predicted posterior samples
+        y_obs: [N, obs_dim] - observations
         seed: int - random seed
         device: torch.device - device to use for metric computation
 
     Returns:
         Dictionary with joint_c2st, joint_wasserstein, joint_mmd
     """
+    # Ensure all data is on CPU before computing metrics
+    theta_true_cpu = theta_true.detach().cpu()
+    theta_pred_cpu = theta_pred.detach().cpu()
+    y_obs_cpu = y_obs.detach().cpu()
+
     # Flatten y_obs if it's multi-dimensional
-    if y_obs.ndim > 2:
-        y_obs = y_obs.reshape(y_obs.shape[0], -1)
+    if y_obs_cpu.ndim > 2:
+        y_obs_cpu = y_obs_cpu.reshape(y_obs_cpu.shape[0], -1)
 
     # Create true joint: [theta_true, y_obs]
-    true_joint = torch.cat([theta_true, y_obs], dim=1)  # [N, d_theta+d_obs]
+    true_joint = torch.cat([theta_true_cpu, y_obs_cpu], dim=1)  # [N, d_theta+d_obs]
 
     # Create predicted joint: [theta_pred, y_obs]
-    pred_joint = torch.cat([theta_pred, y_obs], dim=1)  # [N, d_theta+d_obs]
+    pred_joint = torch.cat([theta_pred_cpu, y_obs_cpu], dim=1)  # [N, d_theta+d_obs]
 
     logger.info(f"Computing joint metrics: true_joint {true_joint.shape}, pred_joint {pred_joint.shape}")
 
@@ -542,11 +690,11 @@ def compute_joint_metrics(
         training_kwargs={'epochs': 100, 'batch_size': 128, 'verbose': False, 'device': str(device)}
     )
 
-    # Compute joint Wasserstein (always uses CPU/numpy)
+    # Compute joint Wasserstein
     logger.info("Computing joint Wasserstein...")
     a = torch.ones(true_joint.shape[0]) / true_joint.shape[0]
     b = torch.ones(pred_joint.shape[0]) / pred_joint.shape[0]
-    M = ot.dist(true_joint.cpu().numpy(), pred_joint.cpu().numpy())
+    M = ot.dist(true_joint.numpy(), pred_joint.numpy())
     joint_wasserstein = float(np.sqrt(ot.emd2(a.numpy(), b.numpy(), M)))
 
     # Compute joint MMD (move to device for computation)
@@ -560,6 +708,152 @@ def compute_joint_metrics(
         'joint_wasserstein': joint_wasserstein,
         'joint_mmd': joint_mmd
     }
+
+
+# ============================================================================
+# GAUSSIAN TASK EVALUATION WITH CONDITIONAL METRICS
+# ============================================================================
+
+def evaluate_gaussian_task_conditional(
+    task_name: str,
+    num_cal_list: list,
+    seed_list: list,
+    data_path: str,
+    output_dir: Path,
+    num_posterior_samples: int = 1000,
+    num_observations: int = 10,
+    max_test_samples: int = None,
+    device: torch.device = torch.device('cpu')
+) -> Dict:
+    """
+    Evaluate NPE-PFN for Gaussian task with conditional metrics.
+
+    For each observation y_obs:
+    - Sample N times from p_true(theta|y_obs)
+    - Sample N times from p_npe-pfn(theta|y_obs)
+    - Compute C2ST, MMD, Wasserstein between these two sets of N samples
+
+    Args:
+        task_name: Should be 'high_dim_gaussian'
+        num_cal_list: List of calibration sizes to evaluate
+        seed_list: List of seeds for subsampling
+        data_path: Path to data directory
+        output_dir: Output directory for results
+        num_posterior_samples: Number of samples to draw from each posterior (N)
+        num_observations: Number of test observations to evaluate
+        max_test_samples: Maximum test samples to load (for selecting observations)
+        device: Device for computation
+    """
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Starting CONDITIONAL evaluation for Gaussian task: {task_name}")
+    logger.info(f"{'='*80}\n")
+
+    # Load data
+    theta_cal, x_cal, y_cal = load_calibration_data(task_name, data_path)
+    theta_test, x_test, y_test = load_test_data(task_name, data_path)
+
+    # Optionally limit test samples
+    if max_test_samples is not None and max_test_samples < len(theta_test):
+        logger.info(f"Limiting test samples to {max_test_samples} (from {len(theta_test)})")
+        theta_test = theta_test[:max_test_samples]
+        x_test = x_test[:max_test_samples]
+        y_test = y_test[:max_test_samples]
+
+    # Select observations to evaluate
+    num_observations = min(num_observations, len(y_test))
+    logger.info(f"Will evaluate {num_observations} observations with {num_posterior_samples} samples each")
+
+    # Create Gaussian posterior parameters (must match data generation)
+    logger.info("Creating Gaussian posterior parameters...")
+    gaussian_params = create_gaussian_posterior_params(
+        seed=0,  # Same seed used in data generation
+        theta_dim=theta_test.shape[1],
+        obs_dim=y_test.shape[1]
+    )
+
+    # Create prior
+    prior = create_prior(task_name)
+    logger.info(f"Created prior for {task_name}")
+
+    # Initialize results
+    task_results = {}
+
+    # Evaluate for each calibration size
+    for num_cal in num_cal_list:
+        logger.info(f"\n--- Calibration size: {num_cal} ---")
+        task_results[str(num_cal)] = {}
+
+        # Evaluate for each seed
+        for seed in seed_list:
+            logger.info(f"\nSeed: {seed}")
+
+            # Subsample calibration data
+            theta_sub, y_sub = subsample_calibration(theta_cal, y_cal, num_cal, seed)
+            logger.info(f"Subsampled calibration data: {theta_sub.shape}, {y_sub.shape}")
+
+            # Initialize NPE-PFN
+            posterior = TabPFN_Based_NPE_PFN(prior=prior)
+            posterior.append_simulations(theta_sub, y_sub)
+            logger.info("Appended simulations to posterior")
+
+            # Store metrics for each observation
+            obs_metrics = []
+
+            # Evaluate each observation
+            for obs_idx in tqdm(range(num_observations), desc=f"Evaluating observations"):
+                y_obs = y_test[obs_idx]
+
+                # Sample N times from true posterior p(theta|y_obs)
+                posterior_dist = compute_gaussian_posterior_distribution(
+                    y_obs.unsqueeze(0), gaussian_params
+                )
+                theta_true_samples = posterior_dist.sample((num_posterior_samples,)).squeeze(1)  # [N, theta_dim]
+
+                # Sample N times from NPE-PFN posterior p_npe-pfn(theta|y_obs)
+                theta_pred_samples = posterior.sample(
+                    sample_shape=torch.Size([num_posterior_samples]),
+                    x=y_obs.unsqueeze(0),
+                )  # [N, theta_dim]
+
+                # Compute conditional metrics for this observation
+                conditional_metrics = compute_conditional_metrics(
+                    theta_pred_samples, theta_true_samples, seed=seed, device=device
+                )
+                conditional_metrics['observation_idx'] = obs_idx
+                obs_metrics.append(conditional_metrics)
+
+                if obs_idx == 0:  # Log first observation as example
+                    logger.info(f"Example obs {obs_idx}: C2ST={conditional_metrics['conditional_c2st']:.4f}, "
+                               f"Wasserstein={conditional_metrics['conditional_wasserstein']:.4f}, "
+                               f"MMD={conditional_metrics['conditional_mmd']:.6f}")
+
+            # Aggregate metrics across observations
+            avg_metrics = {
+                'conditional_c2st_mean': float(np.mean([m['conditional_c2st'] for m in obs_metrics])),
+                'conditional_c2st_std': float(np.std([m['conditional_c2st'] for m in obs_metrics])),
+                'conditional_wasserstein_mean': float(np.mean([m['conditional_wasserstein'] for m in obs_metrics])),
+                'conditional_wasserstein_std': float(np.std([m['conditional_wasserstein'] for m in obs_metrics])),
+                'conditional_mmd_mean': float(np.mean([m['conditional_mmd'] for m in obs_metrics])),
+                'conditional_mmd_std': float(np.std([m['conditional_mmd'] for m in obs_metrics])),
+                'per_observation_metrics': obs_metrics,
+                'timestamp': datetime.now().isoformat()
+            }
+
+            # Store results
+            task_results[str(num_cal)][str(seed)] = avg_metrics
+
+            logger.info(f"Averaged results over {num_observations} observations:")
+            logger.info(f"  C2ST: {avg_metrics['conditional_c2st_mean']:.4f} ± {avg_metrics['conditional_c2st_std']:.4f}")
+            logger.info(f"  Wasserstein: {avg_metrics['conditional_wasserstein_mean']:.4f} ± {avg_metrics['conditional_wasserstein_std']:.4f}")
+            logger.info(f"  MMD: {avg_metrics['conditional_mmd_mean']:.6f} ± {avg_metrics['conditional_mmd_std']:.6f}")
+
+            # Save intermediate results
+            save_results(
+                {task_name: task_results},
+                output_dir / f"results_{task_name}_conditional_partial.json"
+            )
+
+    return task_results
 
 
 # ============================================================================
@@ -723,6 +1017,18 @@ def main():
         default=None,
         help='GPU number to use (e.g., 0, 1, 2...). If not specified, uses CPU or auto-detects GPU'
     )
+    parser.add_argument(
+        '--num_posterior_samples',
+        type=int,
+        default=1000,
+        help='Number of samples to draw from each posterior for conditional evaluation of Gaussian task (default: 1000)'
+    )
+    parser.add_argument(
+        '--num_observations',
+        type=int,
+        default=10,
+        help='Number of test observations to evaluate for conditional evaluation of Gaussian task (default: 10)'
+    )
 
     args = parser.parse_args()
 
@@ -764,6 +1070,9 @@ def main():
     logger.info(f"Batch size: {args.batch_size}")
     logger.info(f"Device: {device}")
     logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Conditional mode params (for Gaussian task):")
+    logger.info(f"  Posterior samples per observation: {args.num_posterior_samples}")
+    logger.info(f"  Number of observations: {args.num_observations}")
 
     # Initialize results
     all_results = {}
@@ -771,16 +1080,33 @@ def main():
     # Evaluate each task
     for task in args.tasks:
         try:
-            task_results = evaluate_task(
-                task_name=task,
-                num_cal_list=args.num_cal,
-                seed_list=args.seeds,
-                data_path=args.data_path,
-                output_dir=output_dir,
-                max_test_samples=args.max_test_samples,
-                batch_size=args.batch_size,
-                device=device
-            )
+            # Use conditional evaluation for Gaussian task (always)
+            if task == 'high_dim_gaussian':
+                logger.info(f"Using CONDITIONAL evaluation for Gaussian task: {task}")
+                task_results = evaluate_gaussian_task_conditional(
+                    task_name=task,
+                    num_cal_list=args.num_cal,
+                    seed_list=args.seeds,
+                    data_path=args.data_path,
+                    output_dir=output_dir,
+                    num_posterior_samples=args.num_posterior_samples,
+                    num_observations=args.num_observations,
+                    max_test_samples=args.max_test_samples,
+                    device=device
+                )
+            else:
+                # Standard joint evaluation for other tasks
+                logger.info(f"Using JOINT evaluation for task: {task}")
+                task_results = evaluate_task(
+                    task_name=task,
+                    num_cal_list=args.num_cal,
+                    seed_list=args.seeds,
+                    data_path=args.data_path,
+                    output_dir=output_dir,
+                    max_test_samples=args.max_test_samples,
+                    batch_size=args.batch_size,
+                    device=device
+                )
             all_results[task] = task_results
         except Exception as e:
             logger.error(f"Error evaluating task {task}: {e}", exc_info=True)
