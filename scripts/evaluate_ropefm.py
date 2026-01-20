@@ -493,7 +493,7 @@ def sample_posteriors(
             x=y_single.unsqueeze(0),  # NPE-PFN expects batch dimension
         )
         # Samples are already on CPU
-        all_samples.append(sample.squeeze())  # [theta_dim]
+        all_samples.append(sample.squeeze(0))  # [theta_dim] - only squeeze batch dim
 
     return torch.stack(all_samples, dim=0)  # [num_test, theta_dim]
 
@@ -623,7 +623,7 @@ def evaluate_task(
 
             # Sample from posterior for each test observation
             logger.info(f"Sampling posteriors for {len(y_test)} test observations...")
-            theta_pred = sample_posteriors(posterior, y_test, batch_size=batch_size, device=device)
+            theta_pred = sample_posteriors(posterior, y_test, device=device)
             logger.info(f"Generated posterior samples: {theta_pred.shape}")
 
             # Compute metrics
