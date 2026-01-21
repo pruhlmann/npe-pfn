@@ -168,6 +168,88 @@ class NPE_PFN_Core:
 
         return samples_batch[:, dim_x:], log_probs_batch
 
+    def _sample_batched(
+        self,
+        x: Tensor,  # [num_obs, dim_x]
+        num_samples_per_obs: int,
+        with_log_prob: bool = False,
+        eps: float = 1e-15,
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        """Sample from posterior for multiple observations with shared context.
+
+        Uses all training data as context (no filtering), enabling true batched
+        prediction through TabPFN.
+
+        Args:
+            x: Observations, shape [num_obs, dim_x]
+            num_samples_per_obs: Number of samples to generate per observation
+            with_log_prob: Whether to compute log probabilities
+            eps: Small constant for numerical stability
+
+        Returns:
+            theta_samples: shape [num_obs, num_samples_per_obs, dim_theta]
+            log_probs: shape [num_obs, num_samples_per_obs] if with_log_prob, else None
+        """
+        num_obs = x.shape[0]
+        dim_x = x.shape[1]
+
+        # Create samples_batch: repeat each obs num_samples_per_obs times
+        # [obs1, obs1, ..., obs2, obs2, ..., obsN, obsN, ...]
+        # Shape: [num_obs * num_samples_per_obs, dim_x]
+        samples_batch = x.repeat_interleave(num_samples_per_obs, dim=0)
+
+        # Shared context: all training data (no filtering)
+        theta_context = self._theta_train
+        x_context = self._x_train
+        joint_data = torch.cat([x_context, theta_context], dim=1)
+        dim_theta = theta_context.shape[1]
+
+        total_samples = num_obs * num_samples_per_obs
+        log_probs_batch = torch.zeros(total_samples) if with_log_prob else None
+
+        # Autoregressive sampling - runs ONCE for all observations
+        for param_idx in range(dim_theta):
+            features_end = dim_x + param_idx
+            target_idx = dim_x + param_idx
+
+            self._model.fit(joint_data[:, :features_end], joint_data[:, target_idx])
+
+            pred_dist = self._model.predict(
+                samples_batch, output_type="full", quantiles=[]
+            )
+            param_samples = pred_dist["criterion"].sample(pred_dist["logits"])
+
+            if with_log_prob:
+                # Ensure param_samples is on the same device as logits for log prob
+                device = pred_dist["logits"].device
+                param_samples_device = param_samples.to(device)
+                dim_log_prob = -pred_dist["criterion"](
+                    pred_dist["logits"], param_samples_device
+                )
+                dim_log_prob = torch.where(
+                    dim_log_prob == float("-inf"),
+                    torch.log(torch.tensor(eps, device=dim_log_prob.device)),
+                    dim_log_prob,
+                )
+                log_probs_batch = log_probs_batch.to(dim_log_prob.device)
+                log_probs_batch += dim_log_prob
+
+            samples_batch = torch.cat([samples_batch, param_samples[:, None]], dim=1)
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+
+        # Extract theta samples and reshape to [num_obs, num_samples, dim_theta]
+        theta_samples = samples_batch[:, dim_x:]
+        theta_samples = theta_samples.reshape(num_obs, num_samples_per_obs, dim_theta)
+
+        if with_log_prob:
+            log_probs_batch = log_probs_batch.reshape(num_obs, num_samples_per_obs)
+            return theta_samples, log_probs_batch
+
+        return theta_samples, None
+
     def sample(
         self,
         sample_shape: torch.Size = torch.Size(),
@@ -230,15 +312,102 @@ class NPE_PFN_Core:
         x: Tensor,
         sample_shape: torch.Size = torch.Size(),
         max_sampling_batch_size: int = 10_000,
-    ):
-        """Sample from the posterior p(theta | x) in a batched manner.
+        with_log_prob: bool = False,
+        eps: float = 1e-15,
+        oversample_factor: float = 1.5,
+        show_progress_bars: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        """Sample from the posterior p(theta | x) for multiple observations.
+
+        Performs true batched sampling through TabPFN without looping over
+        observations. Uses all training data as shared context (no filtering).
 
         Args:
-            x: Observations to condition on
-            sample_shape: Desired shape of samples
-            max_sampling_batch_size: Maximum batch size for sampling
+            x: Observations, shape [num_obs, dim_x]
+            sample_shape: Number of samples per observation, e.g., torch.Size([100])
+            max_sampling_batch_size: Max samples per TabPFN prediction call
+            with_log_prob: Whether to return log probabilities
+            eps: Small constant for numerical stability
+            oversample_factor: Factor to oversample for rejection (default 1.5)
+            show_progress_bars: Whether to show progress (for rejection iterations)
+
+        Returns:
+            If with_log_prob is False:
+                samples: Tensor of shape [num_obs, num_samples, theta_dim]
+            If with_log_prob is True:
+                Tuple of (samples, log_probs) where:
+                    samples: shape [num_obs, num_samples, theta_dim]
+                    log_probs: shape [num_obs, num_samples]
         """
-        raise NotImplementedError
+        # Validate input
+        if self.embedding_net:
+            x = x.reshape(-1, *self.x_shape)
+            x = self.embedding_net(x)
+        x = self._validate_x(x)
+
+        num_obs = x.shape[0]
+        num_samples = torch.Size(sample_shape).numel()
+
+        if self.prior is None:
+            # No rejection needed without prior
+            samples, log_probs = self._sample_batched(
+                x, num_samples, with_log_prob=with_log_prob, eps=eps
+            )
+            if with_log_prob:
+                return samples, log_probs
+            return samples
+
+        # With prior: need rejection sampling to ensure samples in support
+        # Oversample, then filter per observation
+        num_to_sample = int(num_samples * oversample_factor)
+
+        # Collect samples per observation
+        samples_needed = torch.full((num_obs,), num_samples, dtype=torch.long)
+        collected_samples = [[] for _ in range(num_obs)]
+        collected_log_probs = [[] for _ in range(num_obs)] if with_log_prob else None
+
+        max_iter = 10
+        for iteration in range(max_iter):
+            if samples_needed.sum() == 0:
+                break
+
+            # Sample in batch
+            raw_samples, raw_log_probs = self._sample_batched(
+                x, num_to_sample, with_log_prob=with_log_prob, eps=eps
+            )
+
+            # Check prior support for each observation's samples
+            for obs_idx in range(num_obs):
+                if samples_needed[obs_idx] == 0:
+                    continue
+
+                obs_samples = raw_samples[obs_idx]  # [num_to_sample, dim_theta]
+                valid_mask = self._within_support(obs_samples)
+                valid_samples = obs_samples[valid_mask]
+
+                # Take what we need
+                n_take = min(len(valid_samples), samples_needed[obs_idx].item())
+                collected_samples[obs_idx].append(valid_samples[:n_take])
+
+                if with_log_prob:
+                    obs_log_probs = raw_log_probs[obs_idx]
+                    valid_log_probs = obs_log_probs[valid_mask]
+                    collected_log_probs[obs_idx].append(valid_log_probs[:n_take])
+
+                samples_needed[obs_idx] -= n_take
+
+        # Stack results
+        final_samples = torch.stack([
+            torch.cat(s, dim=0)[:num_samples] for s in collected_samples
+        ])  # [num_obs, num_samples, dim_theta]
+
+        if with_log_prob:
+            final_log_probs = torch.stack([
+                torch.cat(lp, dim=0)[:num_samples] for lp in collected_log_probs
+            ])  # [num_obs, num_samples]
+            return final_samples, final_log_probs
+
+        return final_samples
 
     def log_prob(
         self,

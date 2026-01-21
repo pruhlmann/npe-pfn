@@ -315,3 +315,68 @@ def test_sampling_and_log_prob_unconditional_TabPFN(
     assert log_prob.shape == torch.Size([n_posterior])
     assert not torch.isnan(log_prob).any()
     assert not torch.isinf(log_prob).any()
+
+
+@pytest.mark.parametrize(
+    "n_train,n_obs,n_posterior,feature_dim,obs_dim",
+    [
+        pytest.param(100, 3, 10, 2, 2, marks=pytest.mark.fast),
+        pytest.param(100, 5, 50, 3, 4, marks=pytest.mark.fast),
+        pytest.param(500, 10, 100, 4, 6),
+    ],
+)
+def test_sample_batched(n_train, n_obs, n_posterior, feature_dim, obs_dim):
+    """Test sample_batched returns correct shapes and valid samples."""
+    prior = torch.distributions.Normal(
+        torch.zeros(feature_dim), torch.ones(feature_dim)
+    )
+    theta = prior.sample((n_train,))
+    w = torch.randn(obs_dim, feature_dim)
+    x = theta @ w.T + torch.randn(n_train, obs_dim) * 0.1
+    x_test = torch.randn(n_obs, obs_dim)
+
+    # Use base class (no filtering) to test core batched sampling
+    model = NPE_PFN_Core(prior=prior)
+    model.append_simulations(theta, x)
+
+    # Test without log_prob
+    samples = model.sample_batched(
+        x=x_test,
+        sample_shape=torch.Size([n_posterior]),
+    )
+    assert samples.shape == (n_obs, n_posterior, feature_dim)
+    assert not torch.isnan(samples).any()
+
+    # Test with log_prob
+    samples, log_probs = model.sample_batched(
+        x=x_test,
+        sample_shape=torch.Size([n_posterior]),
+        with_log_prob=True,
+    )
+    assert samples.shape == (n_obs, n_posterior, feature_dim)
+    assert log_probs.shape == (n_obs, n_posterior)
+    assert not torch.isnan(samples).any()
+
+
+@pytest.mark.fast
+def test_sample_batched_single_obs_matches_sample():
+    """Test that sample_batched with 1 obs gives same shape as sample."""
+    prior = torch.distributions.Normal(torch.zeros(2), torch.ones(2))
+    theta = prior.sample((100,))
+    x = theta + torch.randn(100, 2) * 0.1
+
+    model = NPE_PFN_Core(prior=prior)
+    model.append_simulations(theta, x)
+
+    x_test = torch.randn(1, 2)
+
+    # sample_batched with 1 observation
+    batched = model.sample_batched(x=x_test, sample_shape=torch.Size([50]))
+    assert batched.shape == (1, 50, 2)
+
+    # Regular sample
+    single = model.sample(x=x_test, sample_shape=torch.Size([50]))
+    assert single.shape == (50, 2)
+
+    # Shapes should be consistent (batched has extra dim)
+    assert batched.squeeze(0).shape == single.shape
