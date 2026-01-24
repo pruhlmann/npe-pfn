@@ -112,17 +112,176 @@ def prepare_observations(
 
 
 # ============================================================================
-# METRIC FUNCTIONS (copied from evaluate_ropefm.py)
+# EMBEDDING NETWORKS FOR DIMENSIONALITY REDUCTION
+# ============================================================================
+
+class ConvNN1D(nn.Module):
+    """1D CNN for embedding pendulum observations (200-dim time series)."""
+
+    def __init__(self, output_dim: int = 10):
+        super(ConvNN1D, self).__init__()
+        self.conv1 = nn.Conv1d(1, 16, 3, 1, dilation=2, padding=1)
+        self.conv2 = nn.Conv1d(16, 64, 3, 2, dilation=2, padding=1)
+        self.conv3 = nn.Conv1d(64, 128, 3, 1, dilation=2, padding=1)
+        self.conv4 = nn.Conv1d(128, 128, 3, 2, dilation=2, padding=1)
+        self.conv5 = nn.Conv1d(128, 128, 3, 1, dilation=2, padding=1)
+        self.conv6 = nn.Conv1d(128, 128, 3, 2, dilation=2, padding=1)
+        self.conv7 = nn.Conv1d(128, 128, 3, 1, dilation=2, padding=1)
+        self.fc1 = nn.Linear(2048, 512)
+        self.fc2 = nn.Linear(512, 128)
+        self.fc3 = nn.Linear(128, 32)
+        self.fc4 = nn.Linear(32, output_dim)
+        self.relu = nn.ReLU()
+        self.pool = nn.AvgPool1d(3, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.reshape(-1, 1, x.shape[1])
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.pool(x)
+        x = self.relu(self.conv3(x))
+        x = self.relu(self.conv4(x))
+        x = self.pool(x)
+        x = self.relu(self.conv5(x))
+        x = self.relu(self.conv6(x))
+        x = self.pool(x)
+        x = self.relu(self.conv7(x))
+        x = torch.flatten(x, 1)
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.relu(self.fc3(x))
+        x = self.fc4(x)
+        return x
+
+
+class ConvNN1DLight_v2(nn.Module):
+    """Lightweight 1D CNN for embedding wind_tunnel observations (50-dim)."""
+
+    def __init__(self, output_dim: int = 10, input_len: int = 50):
+        super(ConvNN1DLight_v2, self).__init__()
+        self.conv1 = nn.Conv1d(1, 16, 3, 1, dilation=2, padding=1)
+        self.conv2 = nn.Conv1d(16, 64, 3, 2, dilation=2, padding=1)
+        self.conv3 = nn.Conv1d(64, 128, 3, 1, dilation=2, padding=1)
+        self.conv4 = nn.Conv1d(128, 128, 3, 2, dilation=2, padding=1)
+        self.relu = nn.ReLU()
+        self.pool = nn.AvgPool1d(kernel_size=3, stride=1)
+
+        # Compute flatten size dynamically
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, input_len)
+            out = self._forward_features(dummy)
+            flat_dim = out.view(1, -1).shape[1]
+
+        self.fc1 = nn.Linear(flat_dim, 128)
+        self.fc2 = nn.Linear(128, 32)
+        self.fc3 = nn.Linear(32, output_dim)
+
+    def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.pool(x)
+        x = self.relu(self.conv3(x))
+        x = self.relu(self.conv4(x))
+        x = self.pool(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.unsqueeze(1)  # (N, L) -> (N, 1, L)
+        x = self._forward_features(x)
+        x = torch.flatten(x, 1)
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+class ConvNN2DLT(nn.Module):
+    """2D CNN for embedding light_tunnel observations (3x64x64 images)."""
+
+    def __init__(self, output_dim: int = 10, image_size: Tuple[int, int, int] = (3, 64, 64)):
+        super(ConvNN2DLT, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, 3, 2, dilation=1)
+        self.conv2 = nn.Conv2d(64, 128, 3, 2, dilation=1)
+        self.conv3 = nn.Conv2d(128, 128, 3, 2, dilation=1)
+        self.conv4 = nn.Conv2d(128, 64, 1, 1, dilation=1)
+        self.conv5 = nn.Conv2d(64, 3, 1, 1, dilation=1)
+        if image_size[1] == 64:
+            in_size = 12
+        elif image_size[1] == 100:
+            in_size = 27
+        else:
+            raise ValueError("Unsupported image size. Supported sizes are 64 and 100.")
+        self.fc1 = nn.Linear(in_size, 100)
+        self.fc2 = nn.Linear(100, output_dim)
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool2d(3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Input has shape (batch_size, C, H, W)"""
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.pool(x)
+        x = self.relu(self.conv3(x))
+        x = self.relu(self.conv4(x))
+        x = self.relu(self.conv5(x))
+        x = torch.flatten(x, 1)
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+def get_embedding_network(name: str, **kwargs) -> nn.Module:
+    """Get embedding network by name."""
+    if name == "conv1d":
+        return ConvNN1D(output_dim=kwargs.get("output_dim", 10))
+    elif name == "conv1d_v2":
+        return ConvNN1DLight_v2(
+            output_dim=kwargs.get("output_dim", 10),
+            input_len=kwargs.get("input_len", 50)
+        )
+    elif name == "conv2d":
+        return ConvNN2DLT(
+            output_dim=kwargs.get("output_dim", 10),
+            image_size=kwargs.get("image_size", (3, 64, 64))
+        )
+    else:
+        return nn.Identity()
+
+
+# ============================================================================
+# METRIC FUNCTIONS
 # ============================================================================
 
 class DefaultMLP(nn.Module):
-    """Default MLP: hidden layers of size 8*dim each, ReLU, output 2 logits."""
+    """Default MLP with optional embedding network for high-dim observations."""
 
-    def __init__(self, input_dim: int, hidden_mult: int = 8):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_mult: int = 8,
+        emb_net: str = "none",
+        theta_dim: Optional[int] = None,
+        x_dim: Optional[Tuple] = None,
+        out_dim: Optional[int] = None,
+        image_size: Optional[Tuple[int, int, int]] = None,
+    ):
         super().__init__()
-        h = hidden_mult * input_dim
+        self.embedding_net = get_embedding_network(
+            emb_net, output_dim=out_dim, image_size=image_size, input_len=x_dim[0] if x_dim else None
+        )
+        self.theta_dim = theta_dim
+        self.x_dim = x_dim
+        self.use_embedding = emb_net != "none" and not isinstance(self.embedding_net, nn.Identity)
+
+        if out_dim is not None and theta_dim is not None and self.use_embedding:
+            h = hidden_mult * (out_dim + theta_dim)
+            in_dim = out_dim + theta_dim
+        else:
+            h = hidden_mult * input_dim
+            in_dim = input_dim
+
         self.net = nn.Sequential(
-            nn.Linear(input_dim, h // 2),
+            nn.Linear(in_dim, h // 2),
             nn.ReLU(),
             nn.Linear(h // 2, h),
             nn.ReLU(),
@@ -133,14 +292,22 @@ class DefaultMLP(nn.Module):
             nn.Linear(h // 2, 2),
         )
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, inputs):
+        if not self.use_embedding:
+            return self.net(inputs)
+        else:
+            theta, x = inputs[:, :self.theta_dim], inputs[:, self.theta_dim:]
+            if self.x_dim is not None and len(self.x_dim) > 1:
+                x = x.view(x.shape[0], *self.x_dim)
+            x_emb = self.embedding_net(x)
+            inputs = torch.cat((theta, x_emb), dim=1)
+            return self.net(inputs)
 
 
 class SmallMLP(nn.Module):
     """Smaller MLP: hidden layers of size 4*dim."""
 
-    def __init__(self, input_dim: int, hidden_mult: int = 4):
+    def __init__(self, input_dim: int, hidden_mult: int = 4, **kwargs):
         super().__init__()
         h = hidden_mult * input_dim
         self.net = nn.Sequential(
@@ -158,7 +325,7 @@ class SmallMLP(nn.Module):
 class LinearClassifier(nn.Module):
     """Simple linear classifier (no hidden layer)."""
 
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, **kwargs):
         super().__init__()
         self.fc = nn.Linear(input_dim, 2)
 
@@ -422,10 +589,10 @@ def create_prior(task_name: str) -> dist.Distribution:
         return dist.Independent(dist.Logistic(torch.zeros(1), torch.ones(1)), 1)
 
     elif task_name == 'light_tunnel':
-        # From ropefm/simulator/light_tunnel.py
-        # Original: Uniform([0,255]^3 × [-180,180]^2) - 5D (RGB + 2 angles)
+        # From ropefm/simulator/light_tunnel.py with rope_f1 model
+        # Original: Uniform([0,255]^3 × [0,1]) - 4D (RGB + alpha)
         # Transformed: Logistic(0, 1) for each dimension
-        return dist.Independent(dist.Logistic(torch.zeros(5), torch.ones(5)), 1)
+        return dist.Independent(dist.Logistic(torch.zeros(4), torch.ones(4)), 1)
 
     elif task_name == 'high_dim_gaussian':
         # From ropefm/simulator/pure_gaussian.py
@@ -451,35 +618,45 @@ def create_prior(task_name: str) -> dist.Distribution:
 def sample_posteriors_batched(
     posterior: TabPFN_Based_NPE_PFN,
     y_test: torch.Tensor,
-    device: torch.device = torch.device('cpu')
+    device: torch.device = torch.device('cpu'),
+    batch_size: int = 128
 ) -> torch.Tensor:
     """
     Generate 1 posterior sample for each test observation using sample_batched.
 
-    This is the key difference from evaluate_ropefm.py which uses a loop.
-    sample_batched processes all observations in a single call.
+    Processes observations in batches to avoid OOM errors.
 
     Args:
         posterior: TabPFN_Based_NPE_PFN instance
         y_test: [num_test, obs_dim] - observations (on CPU for TabPFN)
         device: torch.device - device object (unused, TabPFN requires CPU)
+        batch_size: Number of observations to process at once
 
     Returns:
         theta_pred: [num_test, theta_dim]
     """
-    logger.info(f"Using sample_batched for {len(y_test)} observations...")
+    num_test = len(y_test)
+    logger.info(f"Using sample_batched for {num_test} observations (batch_size={batch_size})...")
 
-    # sample_batched returns [num_obs, num_samples, theta_dim]
-    # We want 1 sample per observation, so sample_shape = torch.Size([1])
-    theta_pred = posterior.sample_batched(
-        x=y_test,  # [num_test, obs_dim]
-        sample_shape=torch.Size([1]),  # 1 sample per observation
-        show_progress_bars=True,
-    )
+    all_samples = []
+    for start_idx in range(0, num_test, batch_size):
+        end_idx = min(start_idx + batch_size, num_test)
+        y_batch = y_test[start_idx:end_idx]
 
-    # Squeeze the sample dimension: [num_test, 1, theta_dim] -> [num_test, theta_dim]
-    theta_pred = theta_pred.squeeze(1)
+        # sample_batched returns [num_obs, num_samples, theta_dim]
+        theta_batch = posterior.sample_batched(
+            x=y_batch,
+            sample_shape=torch.Size([1]),  # 1 sample per observation
+            show_progress_bars=False,
+        )
+        # Squeeze: [batch, 1, theta_dim] -> [batch, theta_dim]
+        theta_batch = theta_batch.squeeze(1)
+        all_samples.append(theta_batch)
 
+        if (end_idx % (batch_size * 10) == 0) or (end_idx == num_test):
+            logger.info(f"  Processed {end_idx}/{num_test} observations")
+
+    theta_pred = torch.cat(all_samples, dim=0)
     logger.info(f"Generated {theta_pred.shape[0]} posterior samples via sample_batched")
     return theta_pred
 
@@ -488,10 +665,57 @@ def sample_posteriors_batched(
 # JOINT METRIC COMPUTATION
 # ============================================================================
 
+def get_model_kwargs_for_task(task_name: str, theta_dim: int, y_shape: Tuple) -> Optional[Dict]:
+    """
+    Get model_kwargs for C2ST classifier based on task.
+
+    This configures the embedding network for dimensionality reduction of
+    high-dimensional observations before C2ST classification.
+
+    Args:
+        task_name: Name of the task
+        theta_dim: Dimension of theta parameters
+        y_shape: Shape of observations (excluding batch dim)
+
+    Returns:
+        model_kwargs dict or None for tasks without embedding
+    """
+    out_dim = 10  # Output dimension of embedding network
+
+    if task_name == 'pendulum':
+        # pendulum has 200-dim observations (time series)
+        return {
+            "emb_net": "conv1d",
+            "theta_dim": theta_dim,
+            "x_dim": y_shape,
+            "out_dim": out_dim,
+        }
+    elif task_name == 'wind_tunnel':
+        # wind_tunnel has 50-dim observations
+        return {
+            "emb_net": "conv1d_v2",
+            "theta_dim": theta_dim,
+            "x_dim": y_shape,
+            "out_dim": out_dim,
+        }
+    elif task_name == 'light_tunnel':
+        # light_tunnel has 3x64x64 = 12288-dim images
+        return {
+            "emb_net": "conv2d",
+            "theta_dim": theta_dim,
+            "x_dim": y_shape,
+            "out_dim": out_dim,
+            "image_size": y_shape,
+        }
+    else:
+        return None
+
+
 def compute_joint_metrics(
     theta_true: torch.Tensor,
     theta_pred: torch.Tensor,
     y_obs: torch.Tensor,
+    task_name: str,
     seed: int = 42,
     device: torch.device = torch.device('cpu')
 ) -> Dict[str, float]:
@@ -501,46 +725,65 @@ def compute_joint_metrics(
     Creates joint distribution [theta, y] and compares:
     - True joint: [theta_true, y_obs]
     - Pred joint: [theta_pred, y_obs]
+
+    Uses task-specific embedding networks for dimensionality reduction
+    of high-dimensional observations before computing C2ST.
     """
     theta_true_cpu = theta_true.detach().cpu()
     theta_pred_cpu = theta_pred.detach().cpu()
     y_obs_cpu = y_obs.detach().cpu()
 
+    theta_dim = theta_true_cpu.shape[1]
+    y_shape = tuple(y_obs_cpu.shape[1:])
+
     # Flatten y_obs if it's multi-dimensional (e.g., images)
     if y_obs_cpu.ndim > 2:
-        y_obs_cpu = y_obs_cpu.reshape(y_obs_cpu.shape[0], -1)
+        y_obs_flat = y_obs_cpu.reshape(y_obs_cpu.shape[0], -1)
+    else:
+        y_obs_flat = y_obs_cpu
 
     # Create joint: [theta, y]
-    true_joint = torch.cat([theta_true_cpu, y_obs_cpu], dim=1)
-    pred_joint = torch.cat([theta_pred_cpu, y_obs_cpu], dim=1)
+    true_joint = torch.cat([theta_true_cpu, y_obs_flat], dim=1)
+    pred_joint = torch.cat([theta_pred_cpu, y_obs_flat], dim=1)
 
     logger.info(f"Computing joint metrics: true_joint {true_joint.shape}, pred_joint {pred_joint.shape}")
 
-    # Joint C2ST
-    logger.info("Computing joint C2ST...")
+    # Get model_kwargs for task-specific embedding
+    model_kwargs = get_model_kwargs_for_task(task_name, theta_dim, y_shape)
+
+    training_kwargs = {
+        'epochs': 150,
+        'batch_size': 128,
+        'verbose': False,
+        'device': str(device)
+    }
+
+    # Joint C2ST with embedding network
+    logger.info(f"Computing joint C2ST with embedding: {model_kwargs.get('emb_net', 'none') if model_kwargs else 'none'}...")
     joint_c2st = classifier_two_samples_test_torch(
         true_joint, pred_joint,
-        seed=seed, n_folds=5, z_score=True, model='mlp',
-        training_kwargs={'epochs': 100, 'batch_size': 128, 'verbose': False, 'device': str(device)}
+        seed=seed, n_folds=3, z_score=True, model='mlp',
+        model_kwargs=model_kwargs,
+        training_kwargs=training_kwargs
     )
 
-    # Joint Wasserstein
-    logger.info("Computing joint Wasserstein...")
-    a = torch.ones(true_joint.shape[0]) / true_joint.shape[0]
-    b = torch.ones(pred_joint.shape[0]) / pred_joint.shape[0]
-    M = ot.dist(true_joint.numpy(), pred_joint.numpy())
+    # Joint Wasserstein (on theta only, not full joint - too high dimensional)
+    logger.info("Computing Wasserstein on theta...")
+    a = torch.ones(theta_true_cpu.shape[0]) / theta_true_cpu.shape[0]
+    b = torch.ones(theta_pred_cpu.shape[0]) / theta_pred_cpu.shape[0]
+    M = ot.dist(theta_true_cpu.numpy(), theta_pred_cpu.numpy())
     joint_wasserstein = float(np.sqrt(ot.emd2(a.numpy(), b.numpy(), M)))
 
-    # Joint MMD
-    logger.info("Computing joint MMD...")
-    true_joint_device = true_joint.to(device)
-    pred_joint_device = pred_joint.to(device)
-    joint_mmd = MMD(true_joint_device, pred_joint_device, kernel='rbf').item()
+    # Joint MMD (on theta only)
+    logger.info("Computing MMD on theta...")
+    theta_true_device = theta_true_cpu.to(device)
+    theta_pred_device = theta_pred_cpu.to(device)
+    joint_mmd = MMD(theta_true_device, theta_pred_device, kernel='rbf').item()
 
     return {
         'joint_c2st': joint_c2st,
-        'joint_wasserstein': joint_wasserstein,
-        'joint_mmd': joint_mmd
+        'wasserstein': joint_wasserstein,
+        'mmd': joint_mmd
     }
 
 
@@ -635,7 +878,7 @@ def evaluate_task_batched(
 
             # Compute metrics
             logger.info("Computing joint metrics...")
-            metrics = compute_joint_metrics(theta_test, theta_pred, y_for_metrics, seed=seed, device=device)
+            metrics = compute_joint_metrics(theta_test, theta_pred, y_for_metrics, task_name=task_name, seed=seed, device=device)
 
             # Store results
             task_results[str(num_cal)][str(seed)] = {
@@ -644,8 +887,8 @@ def evaluate_task_batched(
             }
 
             logger.info(f"Results: C2ST={metrics['joint_c2st']:.4f}, "
-                       f"Wasserstein={metrics['joint_wasserstein']:.4f}, "
-                       f"MMD={metrics['joint_mmd']:.6f}")
+                       f"Wasserstein={metrics['wasserstein']:.4f}, "
+                       f"MMD={metrics['mmd']:.6f}")
 
             # Save intermediate results
             save_results(
